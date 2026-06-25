@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse
 from ultralytics import YOLO
 
 app = FastAPI()
-model = YOLO("yolov8n.pt")
+model = YOLO("yolov8s.pt")
 executor = ThreadPoolExecutor(max_workers=2)
 
 
