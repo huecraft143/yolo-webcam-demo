@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YOLOv8 Real-Time Object Detection</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: #0a0a0a;
+    color: #e0e0e0;
+    font-family: 'Courier New', monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+    padding: 16px;
+    gap: 12px;
+  }
+
+  header {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+  }
+
+  h1 {
+    font-size: clamp(0.85rem, 2.5vw, 1.1rem);
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: #00ff88;
+  }
+
+  .subtitle {
+    font-size: 0.7rem;
+    color: #555;
+    letter-spacing: 1px;
+  }
+
+  #canvas-wrapper {
+    position: relative;
+    border: 1px solid #1e1e1e;
+    box-shadow: 0 0 24px rgba(0, 255, 136, 0.08);
+  }
+
+  #canvas {
+    display: block;
+    max-width: min(640px, 100vw - 32px);
+    max-height: 70vh;
+  }
+
+  #overlay-msg {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.75);
+    font-size: 0.9rem;
+    color: #888;
+    letter-spacing: 1px;
+  }
+
+  #statsbar {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  .badge {
+    background: #111;
+    border: 1px solid #222;
+    border-radius: 4px;
+    padding: 5px 14px;
+    font-size: 0.75rem;
+    letter-spacing: 1px;
+    display: flex;
+    gap: 6px;
+  }
+
+  .badge .label { color: #555; }
+  .badge .value { color: #00ff88; min-width: 3ch; }
+  .badge .value.err { color: #ff6b6b; }
+
+  footer {
+    font-size: 0.65rem;
+    color: #333;
+    letter-spacing: 1px;
+    margin-top: auto;
+    padding-top: 8px;
+  }
+
+  video { display: none; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>YOLOv8 · Real-Time Object Detection</h1>
+  <div class="subtitle">webcam &rarr; websocket &rarr; yolov8n &rarr; bounding boxes</div>
+</header>
+
+<div id="canvas-wrapper">
+  <canvas id="canvas" width="640" height="480"></canvas>
+  <div id="overlay-msg">Requesting camera access&hellip;</div>
+</div>
+
+<div id="statsbar">
+  <div class="badge"><span class="label">STATUS</span><span class="value" id="status">–</span></div>
+  <div class="badge"><span class="label">RENDER</span><span class="value" id="fps">0</span> fps</div>
+  <div class="badge"><span class="label">SERVER</span><span class="value" id="sfps">0</span> fps</div>
+  <div class="badge"><span class="label">OBJECTS</span><span class="value" id="count">0</span></div>
+</div>
+
+<video id="video" autoplay muted playsinline></video>
+
+<footer>YOLOv8n · COCO 80 classes · 640×480</footer>
+
+<script>
+const video    = document.getElementById('video');
+const canvas   = document.getElementById('canvas');
+const ctx      = canvas.getContext('2d');
+const overlayMsg = document.getElementById('overlay-msg');
+const statusEl = document.getElementById('status');
+const fpsEl    = document.getElementById('fps');
+const sfpsEl   = document.getElementById('sfps');
+const countEl  = document.getElementById('count');
+
+// Off-screen canvas sends clean (un-annotated) frames to the server
+const sendCanvas = document.createElement('canvas');
+const sendCtx    = sendCanvas.getContext('2d');
+
+let ws = null;
+let detections = [];
+
+// Throttle: send ~10 frames/s to server
+const SERVER_FPS = 10;
+let lastSendTime = 0;
+
+// Render FPS counter
+let renderFrames = 0, renderFpsTimer = performance.now(), renderFps = 0;
+
+// Server response FPS counter
+let serverFrames = 0, serverFpsTimer = performance.now(), serverFps = 0;
+
+const PALETTE = [
+  '#FF6B6B','#4ECDC4','#45B7D1','#FFEAA7',
+  '#A29BFE','#FD79A8','#55EFC4','#FDCB6E',
+  '#E17055','#74B9FF','#00CEC9','#6C5CE7',
+];
+
+function colorForLabel(label) {
+  let h = 5381;
+  for (const c of label) h = ((h * 33) ^ c.charCodeAt(0)) >>> 0;
+  return PALETTE[h % PALETTE.length];
+}
+
+// ── WebSocket ───────────────────────────────────────────────────────────────
+
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+  ws.onopen = () => {
+    statusEl.textContent = 'Connected';
+    statusEl.classList.remove('err');
+  };
+
+  ws.onclose = () => {
+    statusEl.textContent = 'Reconnecting';
+    statusEl.classList.add('err');
+    setTimeout(connectWS, 2000);
+  };
+
+  ws.onerror = () => ws.close();
+
+  ws.onmessage = (e) => {
+    detections = JSON.parse(e.data);
+    // server FPS
+    serverFrames++;
+    const now = performance.now();
+    if (now - serverFpsTimer >= 1000) {
+      serverFps = serverFrames;
+      serverFrames = 0;
+      serverFpsTimer = now;
+      sfpsEl.textContent = serverFps;
+    }
+  };
+}
+
+// ── Camera ──────────────────────────────────────────────────────────────────
+
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 640 }, height: { ideal: 480 } }
+    });
+    video.srcObject = stream;
+    await video.play();
+
+    canvas.width  = sendCanvas.width  = video.videoWidth  || 640;
+    canvas.height = sendCanvas.height = video.videoHeight || 480;
+
+    overlayMsg.style.display = 'none';
+    connectWS();
+    requestAnimationFrame(render);
+  } catch (err) {
+    overlayMsg.textContent = `Camera error: ${err.message}`;
+    statusEl.textContent = 'No camera';
+    statusEl.classList.add('err');
+  }
+}
+
+// ── Render loop ─────────────────────────────────────────────────────────────
+
+function render() {
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+  countEl.textContent = detections.length;
+
+  for (const d of detections) {
+    const color = colorForLabel(d.label);
+    const bw = d.x2 - d.x1;
+    const bh = d.y2 - d.y1;
+
+    // Box
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(d.x1, d.y1, bw, bh);
+
+    // Corner accents
+    const cs = Math.min(12, bw * 0.15, bh * 0.15);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 3;
+    [
+      [d.x1, d.y1, cs, 0, 0, cs],
+      [d.x2, d.y1, -cs, 0, 0, cs],
+      [d.x1, d.y2, cs, 0, 0, -cs],
+      [d.x2, d.y2, -cs, 0, 0, -cs],
+    ].forEach(([ox, oy, dx1, dy1, dx2, dy2]) => {
+      ctx.beginPath();
+      ctx.moveTo(ox + dx1, oy + dy1);
+      ctx.lineTo(ox, oy);
+      ctx.lineTo(ox + dx2, oy + dy2);
+      ctx.stroke();
+    });
+
+    // Label
+    const text = `${d.label}  ${Math.round(d.conf * 100)}%`;
+    ctx.font = 'bold 12px "Courier New", monospace';
+    const tw = ctx.measureText(text).width;
+    const lx = d.x1;
+    const ly = d.y1 > 22 ? d.y1 - 22 : d.y2 + 2;
+
+    ctx.fillStyle = color;
+    ctx.fillRect(lx, ly, tw + 10, 20);
+    ctx.fillStyle = '#000';
+    ctx.fillText(text, lx + 5, ly + 14);
+  }
+
+  // Render FPS
+  renderFrames++;
+  const now = performance.now();
+  if (now - renderFpsTimer >= 1000) {
+    renderFps = renderFrames;
+    renderFrames = 0;
+    renderFpsTimer = now;
+    fpsEl.textContent = renderFps;
+  }
+
+  // Send clean frame to server (throttled)
+  if (ws?.readyState === WebSocket.OPEN && now - lastSendTime > 1000 / SERVER_FPS) {
+    lastSendTime = now;
+    sendCtx.drawImage(video, 0, 0);
+    sendCanvas.toBlob(blob => {
+      if (blob && ws.readyState === WebSocket.OPEN) {
+        blob.arrayBuffer().then(buf => ws.send(buf));
+      }
+    }, 'image/jpeg', 0.65);
+  }
+
+  requestAnimationFrame(render);
+}
+
+// ── Boot ────────────────────────────────────────────────────────────────────
+
+statusEl.textContent = 'Starting';
+startCamera();
+</script>
+</body>
+</html>

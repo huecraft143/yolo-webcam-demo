@@ -1,0 +1,33 @@
+name: Deploy to Hugging Face Spaces
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare Space files
+        run: |
+          mkdir -p /tmp/hf-space
+          cp main.py          /tmp/hf-space/main.py
+          cp index.html       /tmp/hf-space/index.html
+          cp requirements.txt /tmp/hf-space/requirements.txt
+          cp Dockerfile       /tmp/hf-space/Dockerfile
+          cp README.md        /tmp/hf-space/README.md
+
+      - name: Push to HF Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          cd /tmp/hf-space
+          git init
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+          git add .
+          git commit -m "deploy: ${{ github.sha }}"
+          git branch -m master main
+          git push --force https://huecraft143:$HF_TOKEN@huggingface.co/spaces/huecraft143/yolo-webcam-demo main
